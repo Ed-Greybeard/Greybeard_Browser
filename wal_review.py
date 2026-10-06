@@ -80,7 +80,7 @@ def read_limited(path):
     with open(path, 'rb') as source:
         value = source.read(MAX_FILE_BYTES + 1)
     if len(value) > MAX_FILE_BYTES:
-        raise ValueError('WAL review supports files up to 256 MiB each.')
+        raise ValueError('Database/WAL inspection supports files up to 256 MiB each.')
     return value
 
 
