@@ -1,11 +1,11 @@
-# SQLite Database Browser
+# Greybeard's AI-generated SQLite Database Browser
 
 A desktop database browser written in pure Python with `sqlite3` and Tkinter.
 No third-party packages are required. Use Python 3.9 or newer with Tk support.
 
 NOTE: This was written using OpenAI Codex with very little verification. However,
-my limited testing does make it appear to work. Do not use without manual validation
-ESPECIALLY if you're a forensicator. You know who you are ;)
+in my limited testing it does appear to work. 
+**Do not use without manual validation ESPECIALLY if you're a forensicator.**
 
 ```sh
 python3 db_browser.py
