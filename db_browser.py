@@ -14,6 +14,7 @@ from grid_tools import CellGrid, RecordText, cell_preview, write_cell, write_csv
 from wal_review import inspect_wal, export_snapshot, export_selected, modify_database
 from deleted_recovery import recover_deleted, export_recovered
 from background_search import run_search_process
+from search_navigation import rowid_alias, locate_cell
 
 
 PAGE_SIZE = 200
@@ -45,7 +46,7 @@ def database_objects(connection):
     ).fetchall()
 
 
-def search_database(connection, pattern, ignore_case=False, cancel=None, progress=None):
+def search_database(connection, pattern, ignore_case=False, cancel=None, progress=None, capture=None):
     """Yield each matching cell, including NULL and BLOB values, in all tables/views.
 
     Row numbers are scan positions, not persistent database identifiers. BLOBs are
@@ -57,17 +58,21 @@ def search_database(connection, pattern, ignore_case=False, cancel=None, progres
             return
         if progress:
             progress(name)
-        cursor = connection.execute('SELECT * FROM ' + quote_identifier(name))
-        columns = [item[0] for item in cursor.description]
-        for row_number, row in enumerate(cursor, 1):
+        alias = rowid_alias(connection, name) if capture else None
+        cursor = connection.execute('SELECT ' + (alias + ', ' if alias else '') + '* FROM ' + quote_identifier(name))
+        columns = [item[0] for item in cursor.description][1 if alias else 0:]
+        for row_number, record in enumerate(cursor, 1):
+            row = tuple(record[1:] if alias else record)
             if cancel and cancel.is_set():
                 return
-            for column, value in zip(columns, row):
+            for index, (column, value) in enumerate(zip(columns, row)):
                 text = display_value(value)
                 matched = regex.search(text) is not None
                 if isinstance(value, bytes) and not matched:
                     matched = regex.search(value.decode('utf-8', errors='replace')) is not None
                 if matched:
+                    if capture:
+                        capture((name, row, index, alias, record[0] if alias else None, tuple(columns)))
                     yield name, row_number, column, text
 
 
@@ -91,6 +96,7 @@ class Browser(tk.Tk):
         self.review = None
         self.recovery = None
         self.recovery_items = {}
+        self.search_locators = []
         self.writable = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value='Open a SQLite database to begin.')
         self.build_ui()
@@ -110,8 +116,10 @@ class Browser(tk.Tk):
         self.filename = ttk.Label(toolbar, text='No database open')
         self.filename.pack(side='left', padx=8)
         notebook = ttk.Notebook(self)
+        self.notebook = notebook
         notebook.pack(fill='both', expand=True, padx=8)
         browse = ttk.Frame(notebook)
+        self.browse_tab = browse
         sql = ttk.Frame(notebook)
         search = ttk.Frame(notebook)
         wal = ttk.Frame(notebook)
@@ -273,6 +281,10 @@ class Browser(tk.Tk):
             tree.anchor_cell = cell
             tree.paint()
         menu = tk.Menu(self, tearoff=False)
+        if tree is self.search_grid:
+            menu.add_command(label='Go to table cell', state='disabled' if self.busy else 'normal',
+                             command=lambda item=cell[0]: self.go_to_search_cell(item))
+            menu.add_separator()
         menu.add_command(label='Export cell data…', state='normal' if len(tree.cells) == 1 else 'disabled',
                          command=lambda: self.export_cells(tree, False))
         menu.add_command(label=f'Export {len(tree.cells)} selected cells as CSV…',
@@ -357,7 +369,7 @@ class Browser(tk.Tk):
 
         self.start_job(lambda connection: display_value(value), done, use_connection=False)
 
-    def fill_grid(self, tree, columns, rows, tags=None, item_indices=None):
+    def fill_grid(self, tree, columns, rows, tags=None, item_indices=None, on_complete=None):
         tree.clear_selection()
         tree.raw_rows.clear()
         tree.delete(*tree.get_children())
@@ -398,7 +410,11 @@ class Browser(tk.Tk):
                         break
             except StopIteration:
                 self.render_jobs.pop(tree, None)
-                self.finish_activity()
+                try:
+                    if on_complete:
+                        on_complete()
+                finally:
+                    self.finish_activity()
                 return
             except Exception as error:
                 self.render_jobs.pop(tree, None)
@@ -466,6 +482,7 @@ class Browser(tk.Tk):
     def database_opened(self, path, objects):
         self.path = str(Path(path).resolve())
         self.recovery = None
+        self.search_locators = []
         self.recovery_items.clear()
         if self.review:
             self.review.close()
@@ -647,14 +664,57 @@ class Browser(tk.Tk):
 
         def work(connection):
             return run_search_process(self.path, pattern, ignore_case, self.cancel,
-                                      lambda text: self.events.put(('progress', text)))
+                                      lambda text: self.events.put(('progress', text)), include_locators=True)
 
         def done(result):
-            matches, total = result
+            matches, total, self.search_locators = result
             self.fill_grid(self.search_grid, ['Table / view', 'Row position', 'Column', 'Value'], matches)
             self.status.set(f'{total:,} matching cells. {len(matches):,} displayed.')
 
         self.start_job(work, done, use_connection=False)
+
+    def go_to_search_cell(self, item):
+        if self.busy:
+            return
+        index = list(self.search_grid.get_children()).index(item)
+        locator = self.search_locators[index]
+
+        def work(connection):
+            connection.execute('BEGIN')
+            located = locate_cell(connection, locator, PAGE_SIZE)
+            schema = connection.execute('SELECT sql FROM sqlite_schema WHERE name=?', (locator[0],)).fetchone()
+            return located, schema[0] if schema else ''
+
+        def done(result):
+            (columns, rows, offset, row_index, column), schema = result
+            self.table, self.offset = locator[0], offset
+            self.has_next = len(rows) > PAGE_SIZE
+            self.notebook.select(self.browse_tab)
+            for object_item in self.objects.get_children():
+                if self.objects.item(object_item, 'text') == self.table:
+                    self.objects.selection_set(object_item)
+                    self.objects.see(object_item)
+                    break
+            self.schema.configure(state='normal')
+            self.schema.delete('1.0', 'end')
+            self.schema.insert('1.0', schema or 'No schema available.')
+            self.schema.configure(state='disabled')
+            self.page_label.configure(text=f'Rows {offset + 1}–{offset + min(len(rows), PAGE_SIZE)}')
+
+            def highlight():
+                target = self.table_grid.get_children()[row_index]
+                self.table_grid.see(target)
+                self.table_grid.focus(target)
+                self.table_grid.cells = {(target, column)}
+                self.table_grid.anchor_cell = (target, column)
+                widths = [self.table_grid.column(str(i), 'width') for i in range(len(columns))]
+                self.table_grid.xview_moveto(sum(widths[:column]) / max(1, sum(widths)))
+                self.table_grid.request_paint()
+
+            self.fill_grid(self.table_grid, columns, rows[:PAGE_SIZE], on_complete=highlight)
+            self.status.set(f'Search match highlighted in {self.table}, column {columns[column]}, row {offset + row_index + 1}.')
+
+        self.start_job(work, done)
 
     def close(self):
         self.cancel.set()
